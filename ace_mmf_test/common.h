@@ -3,7 +3,9 @@
 
 #include <fcntl.h>
 #include <unistd.h>
-#include <signal.h>
+#include <csignal>
+#include <chrono>
+#include <cstdint>
 
 #include "ace/Malloc_T.h"
 #include "ace/MMAP_Memory_Pool.h"
@@ -12,44 +14,137 @@
 #include "ace/Process_Semaphore.h"
 #include "ace/Log_Msg.h"
 #include "ace/OS.h"
+#include "ace/Get_Opt.h"
 #include "ace/Reactor.h"
 #include "ace/Time_Value.h"
-#include "ace/Get_Opt.h"
+#include "ace/Unbounded_Queue.h"
 
-// ---- shared memory allocator (MMF-backed, process-safe) ----
-typedef ACE_Malloc_T<ACE_MMAP_Memory_Pool, ACE_Process_Mutex, ACE_Control_Block> SHM_ALLOC;
+// ===================================================================
+// Pool_Growth 에서 추출한 핵심 타입
+// ===================================================================
 
-const int  SIGNATURE    = 123456789;
-const int  HEADER_SIZE  = 8;          // signature(4) + length(4)
-const int  HEADER_MAGIC = 0x414345;   // marks initialized header
+// ---- Record (SimUtil/record.h 호환) ----
+struct Record {
+    int    type_;
+    int    size_;
+    char*  data_;
 
-// ---- defaults -----------------------------------------
-const size_t DEFAULT_MMF_SIZE    = 300UL * 1024 * 1024;  // 300 MB
-const int    DEFAULT_MAX_PAYLOAD = 1 * 1024 * 1024;       // 1 MB
-const int    MAX_RING_CAPACITY   = 8192;                   // 상한
-
-// ---- shared-memory header ----
-// ring 슬롯은 SharedHeader 뒤에 사전 할당된 연속 영역에 있음:
-//   ring_data[i * slot_stride]  (i = 0 .. capacity-1)
-// 슬롯 레이아웃: [int sig][int len][char payload[max_payload]]
-// 동적 malloc/free 없음 → /dev/shm OOM 원천 차단
-struct SharedHeader {
-    int  magic;
-    int  write_idx;
-    int  read_idx;
-    int  count;
-    int  capacity;      // 실제 ring 슬롯 수 (mmf_size에 맞게 자동 계산)
-    int  max_payload;
-    int  mmf_size;
-    int  slot_stride;   // HEADER_SIZE + max_payload (슬롯 1개 크기)
+    Record() : type_(0), size_(0), data_(nullptr) {}
+    Record(int t, int s, char* d) : type_(t), size_(s), data_(d) {}
+    void Init() { type_ = 0; size_ = 0; data_ = nullptr; }
+    char* data() const { return data_; }
+    int   size() const { return size_; }
 };
 
-// ---- ring 슬롯 접근 헬퍼 ----
-inline int*  slot_sig(char* slot)     { return reinterpret_cast<int*>(slot); }
-inline int*  slot_len(char* slot)     { return reinterpret_cast<int*>(slot) + 1; }
-inline char* slot_payload(char* slot) { return slot + HEADER_SIZE; }
+// ---- Unbounded_Queue wrapper (Pool_Growth.h) ----
+template <class T>
+class Unbounded_Queue : public ACE_Unbounded_Queue<T> {
+public:
+    typedef ACE_Unbounded_Queue<T> BASE;
 
-// ---- comma formatting for throughput numbers -------------
+    Unbounded_Queue(ACE_Allocator* allocator = nullptr)
+        : ACE_Unbounded_Queue<T>(allocator) {}
+
+    int enqueue_tail(const T& new_item, ACE_Allocator* allocator) {
+        this->allocator_ = allocator;
+        return BASE::enqueue_tail(new_item);
+    }
+
+    int dequeue_head(T& item, ACE_Allocator* allocator) {
+        this->allocator_ = allocator;
+        return BASE::dequeue_head(item);
+    }
+};
+
+typedef Unbounded_Queue<Record> QUEUE;
+
+// ---- MMF-backed allocator (Pool_Growth) ----
+typedef ACE_Malloc<ACE_MMAP_Memory_Pool, ACE_Process_Mutex>   MALLOC;
+typedef ACE_Allocator_Adapter<MALLOC>                          QUEUE_ALLOCATOR;
+
+// ===================================================================
+// Defaults
+// ===================================================================
+const size_t DEFAULT_MMF_SIZE    = 50UL * 1024 * 1024;   // 50 MB
+const int    DEFAULT_MAX_PAYLOAD = 1024 * 1024;           // 1 MB
+const int    HEADER_MAGIC        = 0x414345;
+
+// ===================================================================
+// CLI Config
+// ===================================================================
+struct Config {
+    size_t mmf_size    = DEFAULT_MMF_SIZE;
+    int    max_payload = DEFAULT_MAX_PAYLOAD;
+    const ACE_TCHAR* shm_file   = nullptr;
+    const ACE_TCHAR* lock_name  = nullptr;
+    const ACE_TCHAR* queue_name = nullptr;
+    const ACE_TCHAR* sem_name   = nullptr;
+};
+
+inline void config_parse(Config& cfg, int argc, ACE_TCHAR* argv[]) {
+    ACE_Get_Opt opt(argc, argv, ACE_TEXT("s:p:f:l:q:e:h"));
+    for (int c; (c = opt()) != -1;) {
+        switch (c) {
+        case 's': cfg.mmf_size    = static_cast<size_t>(ACE_OS::atoi(opt.opt_arg())); break;
+        case 'p': cfg.max_payload = ACE_OS::atoi(opt.opt_arg()); break;
+        case 'f': cfg.shm_file    = opt.opt_arg(); break;
+        case 'l': cfg.lock_name   = opt.opt_arg(); break;
+        case 'q': cfg.queue_name  = opt.opt_arg(); break;
+        case 'e': cfg.sem_name    = opt.opt_arg(); break;
+        case 'h':
+            ACE_DEBUG((LM_INFO,
+                ACE_TEXT("Usage: %s [options]\n")
+                ACE_TEXT("  -s <size>     MMF size (default: 50 MB)\n")
+                ACE_TEXT("  -p <bytes>    Max payload (default: 1 MB)\n")
+                ACE_TEXT("  -f <path>     MMF backing-store path\n")
+                ACE_TEXT("                (default: /dev/shm/ace_mmf.dat)\n")
+                ACE_TEXT("  -l <name>     Lock file / mutex name\n")
+                ACE_TEXT("                (default: ace_mmf_lock)\n")
+                ACE_TEXT("  -q <name>     Queue name inside MMF\n")
+                ACE_TEXT("                (default: queue_test)\n")
+                ACE_TEXT("  -e <name>     Optional semaphore name\n")
+                ACE_TEXT("  -h            Show this help\n"),
+                argc > 0 ? argv[0] : ACE_TEXT("prog")));
+            ACE_OS::exit(0);
+        }
+    }
+}
+
+// ===================================================================
+// ReadyMarker – producer init 완료 후 기록, consumer 가 대기
+// ===================================================================
+struct ReadyMarker {
+    int32_t magic;
+    int32_t pid;
+};
+
+inline void ready_path(char* buf, size_t sz, const ACE_TCHAR* shm_file) {
+    ACE_OS::snprintf(buf, sz, ACE_TEXT("%s.rdy"), shm_file);
+}
+
+inline bool write_ready(const char* ready_path) {
+    ReadyMarker m;
+    m.magic = HEADER_MAGIC;
+    m.pid   = static_cast<int32_t>(ACE_OS::getpid());
+    int fd = ::open(ready_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return false;
+    bool ok = ::write(fd, &m, sizeof(m)) == static_cast<ssize_t>(sizeof(m));
+    ::close(fd);
+    return ok;
+}
+
+inline bool is_ready(const char* ready_path) {
+    ReadyMarker m = {};
+    int fd = ::open(ready_path, O_RDONLY);
+    if (fd < 0) return false;
+    bool ok = ::read(fd, &m, sizeof(m)) == static_cast<ssize_t>(sizeof(m));
+    ::close(fd);
+    return ok && m.magic == HEADER_MAGIC && ::kill(static_cast<pid_t>(m.pid), 0) == 0;
+}
+
+// ===================================================================
+// Formatters
+// ===================================================================
 inline const char* comma_fmt(int val) {
     static char bufs[4][32];
     static int idx = 0;
@@ -73,7 +168,6 @@ inline const char* comma_fmt(int val) {
     return buf;
 }
 
-// ---- MiB/s formatter ------------------------------------
 inline const char* mib_fmt(long long bytes_per_sec) {
     static char bufs[4][32];
     static int idx = 0;
@@ -83,72 +177,4 @@ inline const char* mib_fmt(long long bytes_per_sec) {
     return bufs[idx];
 }
 
-// ---- pool ready-marker (파일 경로: shm_file + ".rdy") ----
-// producer가 pool 완전 초기화 후 기록. consumer는 이 파일이 유효할 때만 pool 접근.
-struct ReadyMarker {
-    int32_t magic;   // HEADER_MAGIC
-    int32_t pid;     // producer PID (생존 여부 확인용)
-};
-
-inline void pool_ready_path(char* buf, size_t sz, const char* shm_file) {
-    ACE_OS::snprintf(buf, sz, "%s.rdy", shm_file);
-}
-
-inline bool pool_write_ready(const char* ready_path) {
-    ReadyMarker m;
-    m.magic = HEADER_MAGIC;
-    m.pid   = static_cast<int32_t>(ACE_OS::getpid());
-    int fd = ::open(ready_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return false;
-    bool ok = ::write(fd, &m, sizeof(m)) == static_cast<ssize_t>(sizeof(m));
-    ::close(fd);
-    return ok;
-}
-
-inline bool pool_is_ready(const char* ready_path) {
-    ReadyMarker m = {};
-    int fd = ::open(ready_path, O_RDONLY);
-    if (fd < 0) return false;
-    bool ok = ::read(fd, &m, sizeof(m)) == static_cast<ssize_t>(sizeof(m));
-    ::close(fd);
-    // magic 확인 + producer 프로세스 생존 확인
-    return ok && m.magic == HEADER_MAGIC && ::kill(static_cast<pid_t>(m.pid), 0) == 0;
-}
-
-// ---- CLI / env helper ------------------------------------
-struct Config {
-    size_t mmf_size    = DEFAULT_MMF_SIZE;
-    int    max_payload = DEFAULT_MAX_PAYLOAD;
-    const ACE_TCHAR* shm_file   = 0;
-    const ACE_TCHAR* mutex_name = 0;
-    const ACE_TCHAR* sem_name   = 0;
-};
-
-inline void config_parse(Config& cfg, int argc, ACE_TCHAR* argv[]) {
-    ACE_Get_Opt opt(argc, argv, ACE_TEXT("s:p:f:m:e:h"));
-    for (int c; (c = opt()) != -1;) {
-        switch (c) {
-        case 's': cfg.mmf_size    = ACE_OS::atoi(opt.opt_arg()); break;
-        case 'p': cfg.max_payload = ACE_OS::atoi(opt.opt_arg()); break;
-        case 'f': cfg.shm_file    = opt.opt_arg(); break;
-        case 'm': cfg.mutex_name  = opt.opt_arg(); break;
-        case 'e': cfg.sem_name    = opt.opt_arg(); break;
-        case 'h':
-            ACE_DEBUG((LM_INFO,
-                ACE_TEXT("Usage: %s [options]\n")
-                ACE_TEXT("  -s <size>     MMF size (default: 300 MB)\n")
-                ACE_TEXT("  -p <bytes>    Max payload (default: 1 MB)\n")
-                ACE_TEXT("  -f <path>     MMF file path\n")
-                ACE_TEXT("                (default: /dev/shm/ace_mmf.dat)\n")
-                ACE_TEXT("  -m <name>     Process mutex name\n")
-                ACE_TEXT("                (default: ace_mmf_mutex)\n")
-                ACE_TEXT("  -e <name>     Process semaphore name\n")
-                ACE_TEXT("                (default: ace_mmf_sem)\n")
-                ACE_TEXT("  -h            Show this help\n"),
-                argc > 0 ? argv[0] : ACE_TEXT("prog")));
-            ACE_OS::exit(0);
-        }
-    }
-}
-
-#endif
+#endif // ACE_MMF_TEST_COMMON_H

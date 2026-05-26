@@ -22,4 +22,4 @@ consumer: consumer.cpp common.h
 clean:
 	rm -f producer consumer *.o *.log core
 
-.PHONY: all clean
+.PHONY: all clean debug

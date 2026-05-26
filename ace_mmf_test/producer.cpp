@@ -1,18 +1,14 @@
 #include "common.h"
 
-#include <csignal>
-#include <chrono>
 #include <vector>
 
 static volatile bool g_running = true;
 extern "C" void handle_signal(int) { g_running = false; }
 
-// -------------------------------------------------------------------
-// build_message  : msg 버퍼에 [sig][len][payload] 기록
-//                  반환값: 기록된 총 바이트 수 (HEADER_SIZE + payload)
-// -------------------------------------------------------------------
-static int build_message(char* buf, int seq, int max_payload)
-{
+// ===================================================================
+// build_message — 테스트용 메시지 생성
+// ===================================================================
+static int build_message(char* buf, int seq, int max_payload) {
     time_t raw = ACE_OS::gettimeofday().sec();
     struct tm tm_buf;
     ACE_OS::localtime_r(&raw, &tm_buf);
@@ -26,24 +22,54 @@ static int build_message(char* buf, int seq, int max_payload)
     int pct    = (seq % 10 + 1) * 10;
     int target = static_cast<int>(static_cast<long long>(max_payload) * pct / 100);
     int min_sz = hdr_len + 5;
-    if (target < min_sz)    target = min_sz;
+    if (target < min_sz)     target = min_sz;
     if (target > max_payload) target = max_payload;
 
-    char* payload = buf + HEADER_SIZE;
-    ACE_OS::memcpy(payload, header, hdr_len);
-
+    ACE_OS::memcpy(buf, header, hdr_len);
     int fill = target - hdr_len - 5;
-    if (fill > 0) ACE_OS::memset(payload + hdr_len, '.', fill);
-    ACE_OS::memcpy(payload + target - 5, "@REAR", 5);
+    if (fill > 0)
+        ACE_OS::memset(buf + hdr_len, '.', fill);
+    ACE_OS::memcpy(buf + target - 5, "@REAR", 5);
+    buf[target] = '\0';
 
-    *slot_sig(buf) = SIGNATURE;
-    *slot_len(buf) = target;
-    return HEADER_SIZE + target;
+    return target;   // payload 길이만 반환 (Record.size_에 저장)
 }
 
-// -------------------------------------------------------------------
-// main
-// -------------------------------------------------------------------
+// ===================================================================
+// init_queue — MMF allocator 생성 + Queue find-or-create (Pool_Growth::init_MAP_Queue)
+// ===================================================================
+static QUEUE* init_queue(QUEUE_ALLOCATOR* shm_alloc,
+                         const ACE_TCHAR* queue_name) {
+    void* temp = nullptr;
+
+    if (shm_alloc->find(queue_name, temp) != 0) {
+        // 신규: Queue 를 MMF 에 할당
+        temp = shm_alloc->malloc(sizeof(QUEUE));
+        if (!temp) {
+            ACE_ERROR((LM_ERROR,
+                ACE_TEXT("%T (%P | %t) [Producer] malloc(QUEUE) failed\n")));
+            return nullptr;
+        }
+        new (temp) QUEUE(shm_alloc);
+
+        if (shm_alloc->bind(queue_name, temp) == -1) {
+            ACE_ERROR((LM_ERROR,
+                ACE_TEXT("%T (%P | %t) [Producer] bind(queue) failed\n")));
+            return nullptr;
+        }
+        ACE_DEBUG((LM_INFO,
+            ACE_TEXT("%T (%P | %t) [Producer] queue created in MMF\n")));
+    } else {
+        ACE_DEBUG((LM_INFO,
+            ACE_TEXT("%T (%P | %t) [Producer] attached to existing queue\n")));
+    }
+
+    return static_cast<QUEUE*>(temp);
+}
+
+// ===================================================================
+// main — QueueIN pattern (Pool_Growth::QueueIN)
+// ===================================================================
 int ACE_TMAIN(int argc, ACE_TCHAR* argv[]) {
     ACE_OS::signal(SIGINT,  handle_signal);
     ACE_OS::signal(SIGTERM, handle_signal);
@@ -53,136 +79,124 @@ int ACE_TMAIN(int argc, ACE_TCHAR* argv[]) {
     config_parse(cfg, argc, argv);
 
     if (!cfg.shm_file)   cfg.shm_file   = ACE_TEXT("/dev/shm/ace_mmf.dat");
-    if (!cfg.mutex_name) cfg.mutex_name = ACE_TEXT("ace_mmf_mutex");
-    if (!cfg.sem_name)   cfg.sem_name   = ACE_TEXT("ace_mmf_sem");
+    if (!cfg.lock_name)  cfg.lock_name  = ACE_TEXT("ace_mmf_lock");
+    if (!cfg.queue_name) cfg.queue_name = ACE_TEXT("queue_test");
 
-    char ready_path[512];
-    pool_ready_path(ready_path, sizeof(ready_path), cfg.shm_file);
-
-    if (!pool_is_ready(ready_path)) {
-        ::unlink(ready_path);
+    // ---- stale 정리 ----
+    char rdy_path[512];
+    ready_path(rdy_path, sizeof(rdy_path), cfg.shm_file);
+    if (!is_ready(rdy_path)) {
+        ::unlink(rdy_path);
         ACE_OS::unlink(cfg.shm_file);
     }
 
+    // ---- MMF allocator 생성 (Pool_Growth::init_MAP_Queue) ----
     ACE_MMAP_Memory_Pool_Options pool_opts(
         ACE_DEFAULT_BASE_ADDR,
         ACE_MMAP_Memory_Pool_Options::ALWAYS_FIXED,
-        true,
+        true,                           // use_fixed_addr = true (생성)
         cfg.mmf_size);
-    SHM_ALLOC shm_alloc(cfg.shm_file, 0, &pool_opts);
 
-    SharedHeader* hdr       = nullptr;
-    char*         ring_data = nullptr;
-    void* tmp = nullptr;
+    QUEUE_ALLOCATOR shm_alloc(cfg.shm_file, 0, &pool_opts);
 
-    if (shm_alloc.find(ACE_TEXT("hdr"), tmp) != 0) {
-        // 신규 초기화
-        // capacity: mmf_size의 80%를 슬롯으로 채울 수 있는 최대값 (상한 MAX_RING_CAPACITY)
-        int slot_stride = HEADER_SIZE + cfg.max_payload;
-        int capacity    = static_cast<int>((cfg.mmf_size * 8 / 10) / slot_stride);
-        if (capacity < 4)                capacity = 4;
-        if (capacity > MAX_RING_CAPACITY) capacity = MAX_RING_CAPACITY;
+    // ---- Queue 초기화 (find-or-create) ----
+    QUEUE* queue = init_queue(&shm_alloc, cfg.queue_name);
+    if (!queue) return 1;
 
-        hdr = static_cast<SharedHeader*>(shm_alloc.malloc(sizeof(SharedHeader)));
-        if (!hdr) {
-            ACE_ERROR_RETURN((LM_ERROR,
-                ACE_TEXT("%T (%P | %t) [Producer] malloc(SharedHeader) failed\n")), 1);
-        }
-        hdr->magic       = HEADER_MAGIC;
-        hdr->write_idx   = 0;
-        hdr->read_idx    = 0;
-        hdr->count       = 0;
-        hdr->capacity    = capacity;
-        hdr->max_payload = cfg.max_payload;
-        hdr->mmf_size    = static_cast<int>(cfg.mmf_size);
-        hdr->slot_stride = slot_stride;
-        shm_alloc.bind(ACE_TEXT("hdr"), hdr);
-
-        // ring 슬롯 사전 할당 — 동적 malloc/free 없이 직접 복사
-        size_t ring_bytes = static_cast<size_t>(capacity) * slot_stride;
-        ring_data = static_cast<char*>(shm_alloc.malloc(ring_bytes));
-        if (!ring_data) {
-            ACE_ERROR_RETURN((LM_ERROR,
-                ACE_TEXT("%T (%P | %t) [Producer] malloc(ring_data) failed\n")), 1);
-        }
-        ACE_OS::memset(ring_data, 0, ring_bytes);
-        shm_alloc.bind(ACE_TEXT("ring"), ring_data);
-
-        if (!pool_write_ready(ready_path)) {
-            ACE_ERROR_RETURN((LM_ERROR,
-                ACE_TEXT("%T (%P | %t) [Producer] pool_write_ready failed\n")), 1);
-        }
-        ACE_DEBUG((LM_INFO,
-            ACE_TEXT("%T (%P | %t) [Producer] pool created "
-                     "(capacity=%d  slot=%d B)\n"),
-            capacity, slot_stride));
-    } else {
-        hdr = static_cast<SharedHeader*>(tmp);
-        if (hdr->magic != HEADER_MAGIC) {
-            ACE_ERROR_RETURN((LM_ERROR,
-                ACE_TEXT("%T (%P | %t) [Producer] invalid hdr magic\n")), 1);
-        }
-        shm_alloc.find(ACE_TEXT("ring"), tmp);
-        ring_data = static_cast<char*>(tmp);
-        ACE_DEBUG((LM_INFO,
-            ACE_TEXT("%T (%P | %t) [Producer] attached to existing pool\n")));
+    // ---- write ReadyMarker ----
+    if (!write_ready(rdy_path)) {
+        ACE_ERROR_RETURN((LM_ERROR,
+            ACE_TEXT("%T (%P | %t) [Producer] write_ready failed\n")), 1);
     }
 
-    ACE_DEBUG((LM_INFO,
-        ACE_TEXT("%T (%P | %t) [Producer] MMF=%s  max_payload=%s B  "
-                 "capacity=%d\n"),
-        cfg.shm_file, comma_fmt(hdr->max_payload), hdr->capacity));
+    // ---- Mutex (lock_name 으로 생성) ----
+    ACE_Process_Mutex mutex(cfg.lock_name);
 
-    ACE_Process_Semaphore sem(0, cfg.sem_name);
-    ACE_Process_Mutex mutex(cfg.mutex_name);
+    // ---- Optional Semaphore ----
+    ACE_Process_Semaphore* sem = nullptr;
+    if (cfg.sem_name)
+        sem = new ACE_Process_Semaphore(0, cfg.sem_name);
 
-    int       seq        = 0;
-    int       last_seq   = 0;
+    // ---- Producer Loop (QueueIN pattern) ----
+    std::vector<char> msg_buf(static_cast<size_t>(cfg.max_payload) + 1);
+    int       seq         = 0;
     long long total_bytes = 0;
     long long last_bytes  = 0;
-    auto t_report = std::chrono::steady_clock::now();
+    int       last_seq    = 0;
+    auto      t_report    = std::chrono::steady_clock::now();
 
-    // 슬롯 크기만큼의 임시 버퍼 (스택 할당)
-    std::vector<char> msg_buf(hdr->slot_stride);
+    ACE_DEBUG((LM_INFO,
+        ACE_TEXT("%T (%P | %t) [Producer] start  MMF=%s  size=%s B\n"),
+        cfg.shm_file, comma_fmt(static_cast<int>(cfg.mmf_size))));
 
     while (g_running) {
-        int msg_len = build_message(msg_buf.data(), ++seq, hdr->max_payload);
-        total_bytes += msg_len;
+        int payload_len = build_message(msg_buf.data(), ++seq, cfg.max_payload);
+        int msg_len     = payload_len;   // build_message 는 payload 만 기록
 
-        bool wrote = false;
+        // ================================================================
+        // QueueIN (Pool_Growth::QueueIN)
+        //   1. mutex lock
+        //   2. shmem_allocator_->malloc()  → MMF 에 공간 할당
+        //   3. memcpy 데이터 복사
+        //   4. Record 생성
+        //   5. once_queue_->enqueue_tail()
+        // ================================================================
         {
             ACE_Guard<ACE_Process_Mutex> guard(mutex);
-            if (hdr->count < hdr->capacity) {
-                char* slot = ring_data + static_cast<size_t>(hdr->write_idx) * hdr->slot_stride;
-                ACE_OS::memcpy(slot, msg_buf.data(), msg_len);
-                hdr->write_idx = (hdr->write_idx + 1) % hdr->capacity;
-                hdr->count++;
-                wrote = true;
+
+            // --- malloc from MMF (Pool_Growth: "char *alloc_str = (char *)this->once_shmem_allocator_->malloc(str_size + 1)") ---
+            char* alloc_str = static_cast<char*>(shm_alloc.malloc(msg_len + 1));
+            if (!alloc_str) {
+                ACE_DEBUG((LM_WARNING,
+                    ACE_TEXT("%T (%P | %t) [Producer] malloc(%d) failed, "
+                             "queue size=%d\n"),
+                    msg_len, queue->size()));
+                ACE_OS::thr_yield();
+                continue;
+            }
+
+            // --- memcpy (Pool_Growth: "ACE_OS::memcpy((char *)alloc_str, (char *)str_data, str_size)") ---
+            ACE_OS::memcpy(alloc_str, msg_buf.data(), msg_len);
+            alloc_str[msg_len] = '\0';
+
+            // --- Record 생성 및 enqueue (Pool_Growth: "Record newRecord(dest_type, str_size, alloc_str)") ---
+            Record newRecord(1, msg_len, alloc_str);
+            if (queue->enqueue_tail(newRecord, &shm_alloc) == -1) {
+                ACE_DEBUG((LM_WARNING,
+                    ACE_TEXT("%T (%P | %t) [Producer] enqueue_tail failed\n")));
+                shm_alloc.free(alloc_str);
+                ACE_OS::thr_yield();
+                continue;
             }
         }
-        if (wrote) sem.release();
 
+        total_bytes += msg_len;
+
+        // Semaphore signal (선택)
+        if (sem) sem->release();
+
+        // ---- 1초 간격 throughput 리포트 ----
         auto elapsed = std::chrono::steady_clock::now() - t_report;
         auto secs = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
         if (secs >= 1) {
             long long bdiff = total_bytes - last_bytes;
             int r = static_cast<int>((seq - last_seq) / secs);
             ACE_DEBUG((LM_INFO,
-                ACE_TEXT("%T (%P | %t) [Producer] %s msg/s  %s\n"),
-                comma_fmt(r), mib_fmt(bdiff / secs)));
+                ACE_TEXT("%T (%P | %t) [Producer] %s msg/s  %s  queue=%d\n"),
+                comma_fmt(r), mib_fmt(bdiff / secs), queue->size()));
             t_report   = std::chrono::steady_clock::now();
             last_seq   = seq;
             last_bytes = total_bytes;
         }
-
-        ACE_OS::thr_yield();
     }
 
     ACE_DEBUG((LM_INFO,
-        ACE_TEXT("%T (%P | %t) [Producer] exit  produced=%s\n"),
-        comma_fmt(seq)));
+        ACE_TEXT("%T (%P | %t) [Producer] exit  produced=%s  remaining=%d\n"),
+        comma_fmt(seq), queue->size()));
 
-    ::unlink(ready_path);
+    delete sem;
+    ::unlink(rdy_path);
     ACE_OS::unlink(cfg.shm_file);
+
     return 0;
 }
