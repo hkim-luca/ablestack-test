@@ -11,7 +11,6 @@
 #include "ace/MMAP_Memory_Pool.h"
 #include "ace/Guard_T.h"
 #include "ace/Process_Mutex.h"
-#include "ace/Process_Semaphore.h"
 #include "ace/Log_Msg.h"
 #include "ace/OS.h"
 #include "ace/Get_Opt.h"
@@ -78,11 +77,10 @@ struct Config {
     const ACE_TCHAR* shm_file   = nullptr;
     const ACE_TCHAR* lock_name  = nullptr;
     const ACE_TCHAR* queue_name = nullptr;
-    const ACE_TCHAR* sem_name   = nullptr;
 };
 
 inline void config_parse(Config& cfg, int argc, ACE_TCHAR* argv[]) {
-    ACE_Get_Opt opt(argc, argv, ACE_TEXT("s:p:f:l:q:e:h"));
+    ACE_Get_Opt opt(argc, argv, ACE_TEXT("s:p:f:l:q:h"));
     for (int c; (c = opt()) != -1;) {
         switch (c) {
         case 's': cfg.mmf_size    = static_cast<size_t>(ACE_OS::atoi(opt.opt_arg())); break;
@@ -90,7 +88,6 @@ inline void config_parse(Config& cfg, int argc, ACE_TCHAR* argv[]) {
         case 'f': cfg.shm_file    = opt.opt_arg(); break;
         case 'l': cfg.lock_name   = opt.opt_arg(); break;
         case 'q': cfg.queue_name  = opt.opt_arg(); break;
-        case 'e': cfg.sem_name    = opt.opt_arg(); break;
         case 'h':
             ACE_DEBUG((LM_INFO,
                 ACE_TEXT("Usage: %s [options]\n")

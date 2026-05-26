@@ -112,11 +112,6 @@ int ACE_TMAIN(int argc, ACE_TCHAR* argv[]) {
     // ---- Mutex (lock_name 으로 생성) ----
     ACE_Process_Mutex mutex(cfg.lock_name);
 
-    // ---- Optional Semaphore ----
-    ACE_Process_Semaphore* sem = nullptr;
-    if (cfg.sem_name)
-        sem = new ACE_Process_Semaphore(0, cfg.sem_name);
-
     // ---- Producer Loop (QueueIN pattern) ----
     std::vector<char> msg_buf(static_cast<size_t>(cfg.max_payload) + 1);
     int       seq         = 0;
@@ -172,9 +167,6 @@ int ACE_TMAIN(int argc, ACE_TCHAR* argv[]) {
 
         total_bytes += msg_len;
 
-        // Semaphore signal (선택)
-        if (sem) sem->release();
-
         // ---- 1초 간격 throughput 리포트 ----
         auto elapsed = std::chrono::steady_clock::now() - t_report;
         auto secs = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
@@ -194,7 +186,6 @@ int ACE_TMAIN(int argc, ACE_TCHAR* argv[]) {
         ACE_TEXT("%T (%P | %t) [Producer] exit  produced=%s  remaining=%d\n"),
         comma_fmt(seq), queue->size()));
 
-    delete sem;
     ::unlink(rdy_path);
     ACE_OS::unlink(cfg.shm_file);
 
